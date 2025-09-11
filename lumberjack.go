@@ -3,7 +3,7 @@
 // Note that this is v2.0 of lumberjack, and should be imported using gopkg.in
 // thusly:
 //
-//   import "gopkg.in/natefinch/lumberjack.v2"
+//	import "gopkg.in/natefinch/lumberjack.v2"
 //
 // The package name remains simply lumberjack, and the code resides at
 // https://github.com/natefinch/lumberjack under the v2.0 branch.
@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -66,7 +67,7 @@ var _ io.WriteCloser = (*Logger)(nil)
 // `/var/log/foo/server.log`, a backup created at 6:30pm on Nov 11 2016 would
 // use the filename `/var/log/foo/server-2016-11-04T18-30-00.000.log`
 //
-// Cleaning Up Old Log Files
+// # Cleaning Up Old Log Files
 //
 // Whenever a new logfile gets created, old log files may be deleted.  The most
 // recent files according to the encoded timestamp will be retained, up to a
@@ -111,8 +112,12 @@ type Logger struct {
 	file *os.File
 	mu   sync.Mutex
 
-	millCh    chan bool
-	startMill sync.Once
+	// 日志轮转后台处理相关字段
+	millCh    chan bool      // 后台处理任务通道
+	startMill sync.Once      // 确保后台 goroutine 只启动一次
+	done      chan struct{}  // 关闭信号通道，用于通知后台 goroutine 退出
+	millWg    sync.WaitGroup // 等待后台 goroutine 完全退出
+	closed    bool           // 标记 Logger 是否已关闭，防止重复关闭
 }
 
 var (
@@ -126,7 +131,26 @@ var (
 	// variable so tests can mock it out and not need to write megabytes of data
 	// to disk.
 	megabyte = 1024 * 1024
+
+	// debugLog 控制是否输出调试日志，用于排查 goroutine 泄露等问题
+	debugLog = false
 )
+
+// logDebug 输出调试日志，仅在 debugLog 为 true 时生效
+func logDebug(format string, args ...interface{}) {
+	if debugLog {
+		log.Printf("[lumberjack-debug] "+format, args...)
+	}
+}
+
+// EnableDebugLog 启用调试日志输出，用于排查 goroutine 泄露等问题
+// 在生产环境中应谨慎使用，因为会产生额外的日志输出
+func EnableDebugLog(enable bool) {
+	debugLog = enable
+	if enable {
+		log.Printf("[lumberjack-debug] 调试日志已启用")
+	}
+}
 
 // Write implements io.Writer.  If a write would cause the log file to be larger
 // than MaxSize, the file is closed, renamed to include a timestamp of the
@@ -135,6 +159,11 @@ var (
 func (l *Logger) Write(p []byte) (n int, err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	// 检查 Logger 是否已关闭
+	if l.closed {
+		return 0, fmt.Errorf("logger is closed")
+	}
 
 	writeLen := int64(len(p))
 	if writeLen > l.max() {
@@ -162,10 +191,26 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 }
 
 // Close implements io.Closer, and closes the current logfile.
+// 同时优雅关闭后台 goroutine，防止 goroutine 泄露
 func (l *Logger) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.close()
+
+	// 防止重复关闭
+	if l.closed {
+		return nil
+	}
+
+	// 标记为已关闭
+	l.closed = true
+
+	// 关闭文件
+	err := l.close()
+
+	// 关闭后台 goroutine
+	l.shutdownMill()
+
+	return err
 }
 
 // close closes the file if it is open.
@@ -176,6 +221,27 @@ func (l *Logger) close() error {
 	err := l.file.Close()
 	l.file = nil
 	return err
+}
+
+// shutdownMill 优雅关闭后台处理 goroutine
+func (l *Logger) shutdownMill() {
+	// 如果 done channel 已经初始化，则关闭它来通知 goroutine 退出
+	if l.done != nil {
+		logDebug("开始关闭后台处理 goroutine，文件: %s", l.filename())
+
+		select {
+		case <-l.done:
+			// 已经关闭，无需重复操作
+			logDebug("后台处理 goroutine 已经关闭，文件: %s", l.filename())
+		default:
+			close(l.done)
+			logDebug("发送关闭信号给后台处理 goroutine，文件: %s", l.filename())
+		}
+
+		// 等待后台 goroutine 完全退出
+		l.millWg.Wait()
+		logDebug("后台处理 goroutine 已完全退出，文件: %s", l.filename())
+	}
 }
 
 // Rotate causes Logger to close the existing log file and immediately create a
@@ -320,9 +386,7 @@ func (l *Logger) millRunOnce() error {
 			// Only count the uncompressed log file or the
 			// compressed log file, not both.
 			fn := f.Name()
-			if strings.HasSuffix(fn, compressSuffix) {
-				fn = fn[:len(fn)-len(compressSuffix)]
-			}
+			fn = strings.TrimSuffix(fn, compressSuffix)
 			preserved[fn] = true
 
 			if len(preserved) > l.MaxBackups {
@@ -375,23 +439,57 @@ func (l *Logger) millRunOnce() error {
 
 // millRun runs in a goroutine to manage post-rotation compression and removal
 // of old log files.
+// 修复版本：支持优雅退出，防止 goroutine 泄露
 func (l *Logger) millRun() {
-	for range l.millCh {
-		// what am I going to do, log this?
-		_ = l.millRunOnce()
+	// 标记 goroutine 开始运行
+	l.millWg.Add(1)
+	defer l.millWg.Done() // 确保在退出时通知等待者
+
+	logDebug("后台处理 goroutine 启动，文件: %s", l.filename())
+	defer logDebug("后台处理 goroutine 退出，文件: %s", l.filename())
+
+	for {
+		select {
+		case <-l.millCh:
+			// 收到处理任务信号，执行日志文件清理
+			logDebug("执行日志文件清理任务，文件: %s", l.filename())
+			_ = l.millRunOnce()
+		case <-l.done:
+			// 收到关闭信号，优雅退出 goroutine
+			logDebug("收到关闭信号，后台处理 goroutine 准备退出，文件: %s", l.filename())
+			return
+		}
 	}
 }
 
 // mill performs post-rotation compression and removal of stale log files,
 // starting the mill goroutine if necessary.
+// 修复版本：初始化关闭信号通道，支持优雅关闭
 func (l *Logger) mill() {
 	l.startMill.Do(func() {
+		// 初始化通道
 		l.millCh = make(chan bool, 1)
+		l.done = make(chan struct{})
+
+		logDebug("初始化后台处理通道，准备启动 goroutine，文件: %s", l.filename())
+
+		// 启动后台处理 goroutine
 		go l.millRun()
 	})
+
+	// 检查是否已关闭，避免向已关闭的 Logger 发送任务
+	if l.closed {
+		logDebug("Logger 已关闭，跳过后台处理任务，文件: %s", l.filename())
+		return
+	}
+
 	select {
 	case l.millCh <- true:
+		// 成功发送处理任务信号
+		logDebug("成功发送后台处理任务信号，文件: %s", l.filename())
 	default:
+		// 通道已满，跳过本次处理（避免阻塞）
+		logDebug("后台处理通道已满，跳过本次任务，文件: %s", l.filename())
 	}
 }
 
