@@ -285,7 +285,7 @@ func (l *Logger) openNew() error {
 		mode = info.Mode()
 		// move the existing file
 		newname := backupName(name, l.LocalTime)
-		if err := os.Rename(name, newname); err != nil {
+		if err := renameFile(name, newname); err != nil {
 			return fmt.Errorf("can't rename log file: %s", err)
 		}
 
@@ -298,7 +298,7 @@ func (l *Logger) openNew() error {
 	// we use truncate here because this should only get called when we've moved
 	// the file ourselves. if someone else creates the file in the meantime,
 	// just wipe out the contents.
-	f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	f, err := openFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
 	if err != nil {
 		return fmt.Errorf("can't open new logfile: %s", err)
 	}
@@ -343,7 +343,7 @@ func (l *Logger) openExistingOrNew(writeLen int) error {
 		return l.rotate()
 	}
 
-	file, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY, 0644)
+	file, err := openFile(filename, os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		// if we fail to open the old log file for some reason, just ignore
 		// it and open a new log file.
@@ -581,7 +581,7 @@ func compressLogFile(src, dst string) (err error) {
 
 	// If this file already exists, we presume it was created by
 	// a previous attempt to compress the log file.
-	gzf, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, fi.Mode())
+	gzf, err := openFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, fi.Mode())
 	if err != nil {
 		return fmt.Errorf("failed to open compressed log file: %v", err)
 	}
