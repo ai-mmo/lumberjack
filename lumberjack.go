@@ -440,9 +440,10 @@ func (l *Logger) millRunOnce() error {
 // millRun runs in a goroutine to manage post-rotation compression and removal
 // of old log files.
 // 修复版本：支持优雅退出，防止 goroutine 泄露
+// 注意：millWg.Add(1) 必须在启动 goroutine 之前调用（在 mill() 中），
+// 以避免与 shutdownMill() 中的 millWg.Wait() 产生数据竞态
 func (l *Logger) millRun() {
-	// 标记 goroutine 开始运行
-	l.millWg.Add(1)
+	// millWg.Add(1) 已在 mill() 中调用，这里只需确保退出时调用 Done()
 	defer l.millWg.Done() // 确保在退出时通知等待者
 
 	logDebug("后台处理 goroutine 启动，文件: %s", l.filename())
@@ -465,6 +466,7 @@ func (l *Logger) millRun() {
 // mill performs post-rotation compression and removal of stale log files,
 // starting the mill goroutine if necessary.
 // 修复版本：初始化关闭信号通道，支持优雅关闭
+// 修复数据竞态：millWg.Add(1) 必须在 go l.millRun() 之前调用
 func (l *Logger) mill() {
 	l.startMill.Do(func() {
 		// 初始化通道
@@ -472,6 +474,9 @@ func (l *Logger) mill() {
 		l.done = make(chan struct{})
 
 		logDebug("初始化后台处理通道，准备启动 goroutine，文件: %s", l.filename())
+		// 【修复数据竞态】在启动 goroutine 之前增加 WaitGroup 计数器
+		// 这样可以确保 shutdownMill() 中的 Wait() 不会在 goroutine 启动前返回
+		l.millWg.Add(1)
 
 		// 启动后台处理 goroutine
 		go l.millRun()
