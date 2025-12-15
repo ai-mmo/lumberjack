@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -21,9 +22,15 @@ import (
 // Since all the tests uses the time to determine filenames etc, we need to
 // control the wall clock as much as possible, which means having a wall clock
 // that doesn't change unless we want it to.
-var fakeCurrentTime = time.Now()
+// 使用 sync.RWMutex 保护 fakeCurrentTime 的并发访问，避免测试代码与后台 goroutine 产生数据竞态
+var (
+	fakeCurrentTime = time.Now()
+	fakeTimeMutex   sync.RWMutex // 保护 fakeCurrentTime 的并发访问
+)
 
 func fakeTime() time.Time {
+	fakeTimeMutex.RLock()
+	defer fakeTimeMutex.RUnlock()
 	return fakeCurrentTime
 }
 
@@ -757,7 +764,10 @@ func fileCount(dir string, exp int, t testing.TB) {
 }
 
 // newFakeTime sets the fake "current time" to two days later.
+// 使用锁保护并发访问，避免与后台 goroutine 中调用 fakeTime() 产生数据竞态
 func newFakeTime() {
+	fakeTimeMutex.Lock()
+	defer fakeTimeMutex.Unlock()
 	fakeCurrentTime = fakeCurrentTime.Add(time.Hour * 24 * 2)
 }
 
